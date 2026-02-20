@@ -1,12 +1,13 @@
 // src/lib.rs
 use std::{
-    sync::{Arc, Mutex, mpsc},
+    sync::{mpsc, Arc, Mutex},
     thread,
 };
 
-pub struct ThreadPool{
+pub struct ThreadPool {
     workers: Vec<Worker>,
-    sender: mpsc::Sender<Job>,
+    // use Option to release ownership at shutdown
+    sender: Option<mpsc::Sender<Job>>,
 }
 
 // struct Job;
@@ -58,21 +59,40 @@ impl ThreadPool {
             // since it can be accessed by multiple threads concurrently
             workers.push(Worker::new(id, Arc::clone(&receiver)));
         }
-        ThreadPool { workers, sender }
+        ThreadPool {
+            workers,
+            sender: Some(sender),
+        }
     }
 
     // execute takes a closure f as its arg
     pub fn execute<F>(&self, f: F)
-        where
-            // FnOnce means a closure that takes void and returns void
-            F: FnOnce() + Send + 'static,
+    where
+        // FnOnce means a closure that takes void and returns void
+        F: FnOnce() + Send + 'static,
     {
         // execute just enqueues f and some worker will poll the queue
         // to actually run the closure
         let job = Box::new(f);
 
         // unwrap means throw if error
-        self.sender.send(job).unwrap();
+        self.sender.as_ref().unwrap().send(job).unwrap();
+    }
+}
+
+// graceful shutdown, let workers finish processing current request
+// before shutdown
+impl Drop for ThreadPool {
+    fn drop(&mut self) {
+        // drop sender so no new requests are accepted
+        // closes channel
+        drop(self.sender.take());
+        // removes all workers from the vector and returns iterator on them
+        for worker in &mut self.workers.drain(..) {
+            println!("Shutting down worker {}", worker.id);
+
+            worker.thread.join().unwrap();
+        }
     }
 }
 
@@ -90,16 +110,24 @@ impl Worker {
                 // unwrap may panic, could use expect for error handling
                 // recv polls job from channel
                 // the recv call may block if channel is empty
-                let job = receiver.lock().unwrap().recv().unwrap();
+                let message = receiver.lock().unwrap().recv();
 
-                // id is a member of Worker
-                println!("Worker {id} got a job, executing.");
-                // job is a closure that is callable
-                job();
+                match message {
+                    Ok(job) => {
+                        // id is a member of Worker
+                        println!("Worker {id} got a job, executing.");
+                        // job is a closure that is callable
+                        job();
+                    }
+                    Err(_) => {
+                        println!("Worker {id} disconnected; shutting down.");
+                        break;
+                    }
+                }
             }
         });
 
-        Worker {id, thread}
+        Worker { id, thread }
     }
 
     // the worker thread should run a loop
